@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -225,6 +225,11 @@ Program::Program() : internal_(std::make_shared<detail::ProgramImpl>()) {
     LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureProgramConstructor, *this);
 }
 
+Program::Program(std::shared_ptr<detail::ProgramImpl> impl) : internal_(std::move(impl)) {
+    LIGHT_METAL_TRACE_FUNCTION_ENTRY();
+    LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureProgramConstructor, *this);
+}
+
 Program::Program(const ProgramDescriptor& descriptor) : internal_(std::make_shared<detail::ProgramImpl>()) {
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
     LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureProgramConstructor, *this);
@@ -375,6 +380,90 @@ std::shared_ptr<Kernel> detail::ProgramImpl::get_kernel(KernelHandle kernel_id) 
     return nullptr;
 }
 
+// ============================================================================
+// Metal 2.0 Name Registry Methods
+// ============================================================================
+
+void ProgramImpl::register_kernel_spec_name(const KernelSpecName& name, KernelHandle handle) {
+    if (!metal2_registry_) {
+        metal2_registry_ = Metal2NameRegistry{};
+    }
+    auto [it, inserted] = metal2_registry_->kernel_handles.try_emplace(name, handle);
+    TT_FATAL(inserted, "Duplicate kernel spec name: {}", name);
+}
+
+void ProgramImpl::register_dfb_spec_name(const DFBSpecName& name, uint32_t dfb_id) {
+    if (!metal2_registry_) {
+        metal2_registry_ = Metal2NameRegistry{};
+    }
+    auto [it, inserted] = metal2_registry_->dfb_handles.try_emplace(name, dfb_id);
+    TT_FATAL(inserted, "Duplicate DFB spec name: {}", name);
+}
+
+void ProgramImpl::register_semaphore_spec_name(const SemaphoreSpecName& name, uint32_t sem_id) {
+    if (!metal2_registry_) {
+        metal2_registry_ = Metal2NameRegistry{};
+    }
+    auto [it, inserted] = metal2_registry_->semaphore_handles.try_emplace(name, sem_id);
+    TT_FATAL(inserted, "Duplicate semaphore spec name: {}", name);
+}
+
+KernelHandle ProgramImpl::get_kernel_handle(const KernelSpecName& name) const {
+    TT_FATAL(metal2_registry_, "Metal 2.0 registry not initialized (program was not created from ProgramSpec)");
+    auto it = metal2_registry_->kernel_handles.find(name);
+    TT_FATAL(it != metal2_registry_->kernel_handles.end(), "Unknown kernel spec name: {}", name);
+    return it->second;
+}
+
+uint32_t ProgramImpl::get_dfb_handle(const DFBSpecName& name) const {
+    TT_FATAL(metal2_registry_, "Metal 2.0 registry not initialized (program was not created from ProgramSpec)");
+    auto it = metal2_registry_->dfb_handles.find(name);
+    TT_FATAL(it != metal2_registry_->dfb_handles.end(), "Unknown DFB spec name: {}", name);
+    return it->second;
+}
+
+uint32_t ProgramImpl::get_semaphore_handle(const SemaphoreSpecName& name) const {
+    TT_FATAL(metal2_registry_, "Metal 2.0 registry not initialized (program was not created from ProgramSpec)");
+    auto it = metal2_registry_->semaphore_handles.find(name);
+    TT_FATAL(it != metal2_registry_->semaphore_handles.end(), "Unknown semaphore spec name: {}", name);
+    return it->second;
+}
+
+void ProgramImpl::register_kernel_rta_schema(
+    const KernelSpecName& name,
+    const std::unordered_map<CoreCoord, size_t>& num_runtime_args_per_node,
+    size_t num_common_runtime_args) {
+    if (!metal2_registry_) {
+        metal2_registry_ = Metal2NameRegistry{};
+    }
+    auto [it, inserted] = metal2_registry_->kernel_rta_schemas.try_emplace(
+        name, KernelRTASchema{num_runtime_args_per_node, num_common_runtime_args});
+    TT_FATAL(inserted, "Duplicate kernel RTA schema for: {}", name);
+}
+
+const ProgramImpl::KernelRTASchema* ProgramImpl::get_kernel_rta_schema(const KernelSpecName& name) const {
+    if (!metal2_registry_) {
+        return nullptr;
+    }
+    auto it = metal2_registry_->kernel_rta_schemas.find(name);
+    if (it == metal2_registry_->kernel_rta_schemas.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+std::vector<KernelSpecName> ProgramImpl::get_registered_kernel_names() const {
+    std::vector<KernelSpecName> names;
+    if (metal2_registry_) {
+        names.reserve(metal2_registry_->kernel_handles.size());
+        for (const auto& [name, handle] : metal2_registry_->kernel_handles) {
+            names.push_back(name);
+        }
+    }
+    return names;
+}
+// ============================================================================
+
 std::vector<detail::KernelMeta> detail::collect_kernel_meta(const Program& program, IDevice* device) {
     return program.impl().collect_kernel_meta(device);
 }
@@ -470,7 +559,7 @@ KernelGroup::KernelGroup(
                 kernel->config());
         }
 
-        // Quasar: set per-processor num_sw_threads and kernel_thread_id for dmk/runtime access
+        // Quasar: set per-processor num_sw_threads and kernel_thread_id for dm/runtime access
         if (auto* qk = dynamic_cast<experimental::quasar::QuasarDataMovementKernel*>(kernel.get())) {
             auto config = std::get<experimental::quasar::QuasarDataMovementConfig>(qk->config());
             const auto& dm_cores = qk->get_dm_processors();
@@ -481,6 +570,56 @@ KernelGroup::KernelGroup(
                     qk->get_kernel_processor_type(static_cast<int>(thread_idx)));
                 kernel_config.num_sw_threads()[processor_index] = config.num_threads_per_cluster;
                 kernel_config.kernel_thread_id()[processor_index] = thread_idx;
+            }
+        }
+        // Quasar: set per-processor num_sw_threads and kernel_thread_id for trisc/runtime access
+        if (auto* qk = dynamic_cast<experimental::quasar::QuasarComputeKernel*>(kernel.get())) {
+            auto config = std::get<experimental::quasar::QuasarComputeConfig>(qk->config());
+            const auto& compute_cores = qk->get_compute_processors();
+            // Track which NEOs have been used to ensure we don't use the same NEO multiple times
+
+            // Every trisc core in a single NEO/Tensix engine shares the same num_sw_threads and kernel_thread_id
+            std::set<uint32_t> neo_indices_set;
+            for (auto compute_core : compute_cores) {
+                switch (compute_core) {
+                    case experimental::quasar::QuasarComputeProcessor::NEO_0_COMPUTE_0:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_0_COMPUTE_1:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_0_COMPUTE_2:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_0_COMPUTE_3:
+                        neo_indices_set.insert(0);
+                        break;
+                    case experimental::quasar::QuasarComputeProcessor::NEO_1_COMPUTE_0:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_1_COMPUTE_1:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_1_COMPUTE_2:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_1_COMPUTE_3:
+                        neo_indices_set.insert(1);
+                        break;
+                    case experimental::quasar::QuasarComputeProcessor::NEO_2_COMPUTE_0:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_2_COMPUTE_1:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_2_COMPUTE_2:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_2_COMPUTE_3:
+                        neo_indices_set.insert(2);
+                        break;
+                    case experimental::quasar::QuasarComputeProcessor::NEO_3_COMPUTE_0:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_3_COMPUTE_1:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_3_COMPUTE_2:
+                    case experimental::quasar::QuasarComputeProcessor::NEO_3_COMPUTE_3:
+                        neo_indices_set.insert(3);
+                        break;
+                }
+            }
+            std::vector<uint32_t> neo_indices_used(neo_indices_set.begin(), neo_indices_set.end());
+            TT_ASSERT(
+                neo_indices_used.size() == config.num_threads_per_cluster,
+                "Number of NEOs used must match number of threads per cluster");
+            // Now that we know which NEOs have been used, we can set the num_sw_threads and kernel_thread_id for each
+            // Tensix engine
+            for (uint32_t thread_idx = 0; thread_idx < config.num_threads_per_cluster; thread_idx++) {
+                uint32_t neo_id = neo_indices_used[thread_idx];
+                // First set of indices are used for DM cores, second set are used for Tensix engines
+                uint32_t config_index = experimental::quasar::QUASAR_NUM_DM_CORES_PER_CLUSTER + neo_id;
+                kernel_config.num_sw_threads()[config_index] = config.num_threads_per_cluster;
+                kernel_config.kernel_thread_id()[config_index] = thread_idx;
             }
         }
     }
@@ -668,7 +807,7 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
                         // KernelGroup to hold value of number of dfbs
                         auto local_dfb_val = per_core_num_dfbs_.find(core);
                         if (local_dfb_val != per_core_num_dfbs_.end()) {
-                            num_dfbs += local_dfb_val->second;
+                            num_dfbs = local_dfb_val->second;
                         }
                     }
                 }
@@ -1855,7 +1994,7 @@ uint32_t detail::ProgramImpl::finalize_program_offsets(
         size_t max_size = get_ringbuffer_size(device, programmable_core_type);
 
         TT_FATAL(
-            state.offset < max_size,
+            state.offset <= max_size,
             "Program size ({}) too large for kernel config buffer ({}) on {}",
             state.offset,
             max_size,
@@ -1871,11 +2010,16 @@ uint32_t detail::ProgramImpl::finalize_program_offsets(
         program->set_program_attrs_across_core_types(device);
     }
 
-    // determine max program size across all programs
+    // Determine the DRAM kernel binary size per program and the max across all programs.
+    // populate_dispatch_data (called above via set_program_attrs_across_core_types) packs all
+    // kernel binaries from every core type into program_transfer_info.binary_data, so its size
+    // reflects the full unpadded binary payload the prefetcher must cache.
     uint32_t max_program_sizeB = 0;
     for (auto& program : programs) {
-        program->kernel_bins_sizeB = state.kernel_text_size;
-        max_program_sizeB = std::max(max_program_sizeB, state.kernel_text_size);
+        uint32_t binary_sizeB =
+            static_cast<uint32_t>(program->get_program_transfer_info().binary_data.size() * sizeof(uint32_t));
+        program->kernel_bins_sizeB = binary_sizeB;
+        max_program_sizeB = std::max(max_program_sizeB, binary_sizeB);
     }
     return max_program_sizeB;
 }
